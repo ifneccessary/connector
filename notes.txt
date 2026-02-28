@@ -1,0 +1,19 @@
+TODO 29 FEB
+
+connection termination handler on agent and server
+
+
+input validations on server side !!!!
+
+alerts finish
+
+implement functitonality of sharring shell stdout to other members and other membersshould ccept to see or deny
+
+
+last one --- add colors
+
+______________
+
+maybe add pty 
+
+maybe replacing thread with asyncio or selectors
