@@ -1,19 +1,10 @@
-TODO 29 FEB
-
-connection termination handler on agent and server
+3. IMPLEMENT SHELL HANDLER PTY, WINPTY from scratch
 
 
-input validations on server side !!!!
-
-alerts finish
-
-implement functitonality of sharring shell stdout to other members and other membersshould ccept to see or deny
 
 
-last one --- add colors
 
-______________
+2. load sniffer functionlity
 
-maybe add pty 
 
-maybe replacing thread with asyncio or selectors
+

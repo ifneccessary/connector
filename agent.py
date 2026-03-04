@@ -1,4 +1,4 @@
-import socket,os,struct,json,threading,subprocess,platform,getpass
+import socket,os,struct,json,threading,subprocess,platform,getpass,selectors,time
 from queue import Queue
 from cryptography.hazmat.primitives.ciphers import Cipher,algorithms,modes
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -18,25 +18,46 @@ class DB():
       ("pub", "send message to all members"),
       ("priv [user]", "send message to a specific member"),
       ("ls", "list all active members"),
-      ("shell share [users(optional)]", "expose your system; optional users restrict access, default public"),
+      ("shell share [pub/priv] [users(optional)]", "expose access to your system; optional users restrict access, default public. pub/priv manages whether all members or only connector member will see output of shell. IF set to 'pub' then any member can sniff shell outputs via get [channel_id] cmd. Default value is priv for your safety!"),
       ("ssh [user]", "open shell session to a user who exposed their system"),
       ("systems", "list all exposed systems"),
       ("shells", "list active shell sessions"),
       ("shell exit", "stop exposing your system"),
-      ("help", "display command list")
+      ("help", "display commands")
   ]
   print(f"{HEADER}{'COMMAND':<20}DESCRIPTION{ENDC}")
   print("-"*60)
   for cmd, desc in commands:
       print(f"{CMD}{cmd:<20}{DESC}{desc}{ENDC}")
-
+ 
+ def EXIT(self):
+  print("// Exiting Connecion...")
+  time.sleep(0.5)
+  self.kill.set()
+  if self.shell_channels:
+    print('// Terminating shell channels...')
+    time.sleep(0.2)
+    for channel in self.shell_channels:
+      channel['process'].kill()
+  self.sk.sendall(self.craft({'type':"EXIT_MAIN"},self.crypto_key))
+  try:
+   self.sk.shutdown(socket.SHUT_RDWR)
+  except OSError:
+    pass
+  finally: 
+   self.sk.close()   
+ kill=threading.Event()
+ send_activate=threading.Event()
+ recv_activate=threading.Event()
  crypto_key=None
  sk:socket.SocketType;
  system_expose=False
  shell_channels=[]
  shell_mode=False
+ sniff_mode=False
  shell_executions=None
-
+ 
+ 
  
 class Crypto(DB):
  def encrypt(self,data,token):
@@ -67,17 +88,24 @@ class Crafters(Crypto):
   recvd_len_len=0
   recvd=b''
   while recvd_len_len<len_len:
-   data=sock.recv(len_len-recvd_len_len)
+   try:
+    data=sock.recv(len_len-recvd_len_len)
+   except (OSError,ConnectionResetError):
+     return None
+   if not data:
+     return None
    recvd_len_len+=len(data)
    recvd+=data
   return recvd
 
  def craft(self,data,key=None)->bytes:
-  _data:bytes;
+  _data:bytes=b'';
   if isinstance(data,dict):
    _data=json.dumps(data).encode()
   elif not isinstance(data,bytes) and isinstance(data,str):
    _data=data.encode() 
+  else:
+    _data=data 
   if key: 
    _data=self.encrypt(_data,key)
   data_len=struct.pack('!I',len(_data))
@@ -85,11 +113,19 @@ class Crafters(Crypto):
   return to_send
  
  def inbound_uncraft(self,sock,key=None)->dict:
-    data_length=struct.unpack('!I',self.recv_length(sock,4))[0]
+    length=self.recv_length(sock,4)
+    if not length:
+      raise ConnectionResetError()
+    data_length=struct.unpack('!I',length)[0]
     data_bytes=b''
     recvd_bytes_len=0
     while recvd_bytes_len < data_length:
-      recvd=sock.recv(data_length-recvd_bytes_len)
+      try:
+       recvd=sock.recv(data_length-recvd_bytes_len)
+      except (OSError,ConnectionResetError):
+        raise ConnectionResetError()
+      if not recvd:
+        raise ConnectionResetError()  
       recvd_bytes_len+=len(recvd)
       data_bytes+=recvd
     if key:
@@ -97,81 +133,148 @@ class Crafters(Crypto):
     formatted:dict=json.loads(data_bytes)
     return formatted
  
- def outbound_uncraft(self,sock,key=None)->str:
-   l=struct.unpack('!I',self.recv_length(sock,4))[0]
+ def outbound_uncraft(self,sock,key=None,decode=True):
+   length=self.recv_length(sock,4)
+   if not length:
+    raise OSError()
+   l=struct.unpack('!I',length)[0]
    recvd_l=0
    recvd_b=b''
    while recvd_l<l:
-    recvd=sock.recv(l-recvd_l) 
+    try:  
+     recvd=sock.recv(l-recvd_l) 
+    except (OSError,ConnectionResetError):
+      recvd=b''
+      break
     recvd_l+=len(recvd)
     recvd_b+=recvd
    if key:
     recvd_b=self.decrypt(recvd_b,key) 
-   return recvd_b.decode()
+   if decode: 
+    return recvd_b.decode()
+   return recvd_b
 
-
+class Operations(Crafters):
+ pass
 class ShellHandlers(Crafters):
-   @staticmethod
-   def shell_stdout_proto_wrapper(dst,stdout):
-    return {
-      'type':'SHELL_SESSION',
-      'dir':'<--',
-      'stdout':stdout,
-      #src isset by server
-      'dst':dst
-    }
+   
+   def terminate_shell(self,chann_id,sharer):
+     self.terminate_channel(chann_id)
+     self.sk.sendall(self.craft({
+      'type':'SHELL_TERM_REQUEST',
+      'connector':chann_id,
+      'sharer': sharer
+     },self.crypto_key))
+     return 0
    
    def shell_handle(self,data:dict):
-     shell=None
-     marker='__CMD_FIN__'
-     chann_id=data['src']
-     cmd_raw=data['cmd']
-     if cmd_raw=='EXIT':
-      self.terminate_channel(chann_id)
-      self.craft({'type':'SHELL_TERMINATION_REQUEST','connector':chann_id,'sharer':data['dst']},self.crypto_key)
-      return 0
-     command=f"{cmd_raw};echo {marker}\n"
-     output=''
-     for channel in self.shell_channels:
-       if channel['id']==chann_id:
-        shell=channel['process']
-        break
-     shell.stdin.write(command)
-     shell.stdin.flush()
-     output_lines=[]
-     while True:
-       line=shell.stdout.readline()
-       if not line:
+      shell=None
+      marker='__CMD_FIN__'
+      chann_id=data['id']
+      cmd_raw=data['cmd']
+      src=data['src']
+      command=''
+      if cmd_raw=='EXIT':
+        return self.terminate_shell(chann_id,data['dst'])
+      if platform.system().lower() in ('linux','darwin','macos'):
+       command=f"{cmd_raw}; echo {marker}\n"
+      else:
+        command=f"{cmd_raw} & echo {marker}\n"
+      for channel in self.shell_channels:
+        if channel['id']==chann_id:
+          shell=channel['process']
           break
-       if marker in line:
-          break
-       output_lines.append(line) 
-     output=''.join(output_lines)   
-     on_wire=self.craft(self.shell_stdout_proto_wrapper(chann_id,output),self.crypto_key)
-     self.sk.sendall(on_wire)
- # stopped hier
+      shell.stdin.write(command)
+      shell.stdin.flush()
+      stdout_lines=[]
+      stderr_lines=[]
+# your code here
+      if shell is None:
+          return
+
+      sel = selectors.DefaultSelector()
+      sel.register(shell.stdout, selectors.EVENT_READ)
+      sel.register(shell.stderr, selectors.EVENT_READ)
+
+      stdout_done = False
+
+      try:
+          while not stdout_done:
+              events = sel.select(timeout=0.5)
+
+              if not events:
+                  if shell.poll() is not None:
+                      break
+                  continue
+
+              for key, _ in events:
+                  stream = key.fileobj
+                  line = stream.readline()
+
+                  if not line:
+                      continue
+
+                  if stream is shell.stdout:
+                      if marker in line:
+                          stdout_done = True
+                      else:
+                          stdout_lines.append(line.rstrip())
+
+                  elif stream is shell.stderr:
+                      stderr_lines.append(line.rstrip())
+
+          drain_start = time.time()
+          while time.time() - drain_start < 0.2:
+              events = sel.select(timeout=0)
+              if not events:
+                  break
+
+              for key, _ in events:
+                  stream = key.fileobj
+                  line = stream.readline()
+                  if not line:
+                      continue
+
+                  if stream is shell.stdout:
+                      stdout_lines.append(line.rstrip())
+                  elif stream is shell.stderr:
+                      stderr_lines.append(line.rstrip())
+
+      finally:
+          sel.close()
+#
+
+      ssh_return=' '.join(stdout_lines+stderr_lines)
+      self.sk.sendall(self.craft({
+        'type':'SHELL_SESSION',
+        'dir':'<--',
+        'stdout':ssh_return,
+        #src isset by server
+        'id':chann_id,
+        'dst':src
+      },self.crypto_key))
 
    def register_shell(self,data):
-     system=platform.system().lower()
-     shell_process=''
-     if system in ('linux','darwin','macos'):
-       shell_process='/bin/bash'
-     elif system in ('windows'):
-       shell_process='cmd.exe'
-     channel_config={
-       'id':data['connector'],
-       'process':subprocess.Popen(
-         shell_process,
-         text=True,
-         shell=False,
-         stdout=subprocess.PIPE,
-         stderr=subprocess.PIPE,
-         stdin=subprocess.PIPE,
-         bufsize=1
-       )
-     }
-     self.shell_channels.append(channel_config)
-     return 0
+        system=platform.system().lower()
+        shell_process=''
+        if system in ('linux','darwin','macos'):
+         shell_process=['/bin/bash','-i']
+        elif system in ('windows','nt'):
+         shell_process='cmd.exe'
+        channel_config={
+        'id':data['id'],
+        'process':subprocess.Popen(
+            shell_process,
+            text=True,
+            shell=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE,
+            bufsize=0
+        )
+        }
+        self.shell_channels.append(channel_config)
+        return 0
    
    def terminate_channel(self,c_id):
     actives=[]
@@ -183,7 +286,7 @@ class ShellHandlers(Crafters):
     self.shell_channels=actives    
    
    def shell_req_handler(self,data:dict,send_activate:threading.Event):
-    print(f'***Sys Access has been requested from {data['connector']}!')
+    print(f'***Sys Access has been requested from {data["connector"]}!')
     if self.system_expose:
      self.register_shell(data)
      print(f'***Sys Access has been Granted!')
@@ -191,17 +294,8 @@ class ShellHandlers(Crafters):
       print(f"***Sys Access has been Denied!\n ***If you'd like to grant access type SHELL SHARE***")
 
 
-# below is shell handler Connector SIde!!!!!
-
    @staticmethod 
-   def shell_protocol_wrapper(cmd,sharer):
-     return {
-       'type':'SHELL_SESSION',
-       'dir':'-->',
-       'cmd':cmd,
-       #src is added by server
-       'dst':sharer
-     }
+   
    @staticmethod
    def extract_stdout(resp:dict):
      if resp['type']=='SHELL_SESSION':
@@ -209,62 +303,112 @@ class ShellHandlers(Crafters):
       return executed_bin
      return None
   
-   def spawn_shell(self,data):
-     # spawn_shell() [local agent]  ----> shell_forward() [server] ---> shell_handle() [remote agent]
+   def spawn_shell(self,data,shell_id):
     sharer=data['sharer']
     run_as=data['run-as']
     try:
      while True:
       cmd=input(f'{run_as}# ').strip()
-      if cmd.upper()=='EXIT':
-        raise KeyboardInterrupt()
-      on_wire=self.craft(self.shell_protocol_wrapper(cmd,sharer),self.crypto_key)
+      if cmd.upper() in ('QUIT','EXIT'):
+        raise ValueError()
+      on_wire=self.craft({
+       'type':'SHELL_SESSION',
+       'dir':'-->',
+       'cmd':cmd,
+       'dst':sharer,
+       'id':shell_id  
+     },self.crypto_key)
       self.sk.sendall(on_wire)
       resp=self.shell_executions.get(timeout=None)
       cmd_exec=self.extract_stdout(resp)
       if cmd_exec:
        print(cmd_exec)
-    except KeyboardInterrupt:
+    except ValueError:
       self.shell_executions=None
       self.shell_mode=False
-      self.sk.sendall(self.craft(self.shell_protocol_wrapper('EXIT',sharer),self.crypto_key))
+      self.sk.sendall(self.craft({
+        'type':None
+      },self.crypto_key))
       print("Exiting shell...")
+   
    def shell_req_res(self,data,send_activate:threading.Event,recv_activate:threading.Event):
       status=data['status']
+      shell_id=data['id']
       if status=='TRUE':
        self.shell_mode=True
        self.shell_executions=Queue()
        send_activate.clear()
-       self.spawn_shell(data)
+       self.spawn_shell(data,shell_id)
        send_activate.set()
        return 0
       msg=data['code']
       print(msg)
-       
+
+class InputValidation():
+  @staticmethod
+  def validate(protocol,cmd:list):
+    if protocol=='PUB':
+     if len(cmd)>1:
+      return True
+     return False
+    elif  protocol=='PRIV':
+      if len(cmd)>2:
+       return True
+      return False
+    elif  protocol=='LS':
+      return True
+    elif protocol=='SHELL':
+      if len(cmd)>=2:
+       return True
+    elif protocol=='SSH':
+      if len(cmd)==2:
+        return True
+      return False
+    elif protocol=='SYSTEMS':
+     return True
+    elif protocol=='SHELLS':
+      if len(cmd)==2:
+        return True
+      return False
+    elif protocol=='READ':
+      if len(cmd)>1:
+        return True
+      return False
       
-class ProtocolEncapsMethods(DB):
+
+class ProtocolEncapsMethods(DB):  
   @staticmethod
   def shell_req_encaps(cmd):
-    return {
-      'type':'SHELL_REQ',
-      'target':cmd[1]
-    }
+      return {
+        'type':'SHELL_REQ',
+        'target':cmd[0].strip()
+      }
   @staticmethod 
   def shell_share_encaps(args):
-     return {
-       'type':'SHELL_SHARE',
+      args=[arg.strip() for arg in args]
+      scope=None
+      subtype=args[0].upper() if args else 'PRIV'
+      if subtype not in ('PRIV','PUB'):
+       subtype='PRIV'
+       scope=args
+      else:
+       scope=args[1:] if len(args)>1 else ['PUBLIC'] 
+      return {
+        'type':'SHELL_SHARE',
         'OS':platform.system(),
         'OS-RELEASE':platform.release(),
         'RUN-AS':getpass.getuser(),
-        'scope':args[0:] if len(args)>=1 else ['PUBLIC']
+        'scope':scope,
+        'subtype':subtype.upper(),
      }
-   
+ 
+  
   @staticmethod
   def priv_encaps(proto,cmd):
       return {
         'type':proto,
-        'target':cmd[1],
-        'payload':' '.join(cmd[2:])
+        'target':cmd[1].strip(),
+        'payload':' '.join(cmd[2:]).strip()
       }
   @staticmethod
   def pub_encaps(proto,cmd):
@@ -287,50 +431,50 @@ class ProtocolEncapsMethods(DB):
     return {
       'type':proto
     }
-  
+  def exit_sniff(self):
+    print(f'// Exiting sniffing mode...')
+    self.sniff_mode=False    
   def cancel_shell_share(self):
     self.system_expose=False
     self.shell_channels=[]
     return {
       'type':'CANCEL_SHELL_SHARE'
     }
-    
-
-class InputValidation():
-  @staticmethod
-  def validate(protocol,cmd):
-    # not finished #######
-    if protocol=='PUB':
-     return True
-    elif  protocol=='PRIV':
-      return True
-    elif  protocol=='LS':
-      return True
-    elif protocol=='SHELL':
-      return True
+  def read_shell_channel_encaps(self,proto,chann_id):
+    self.sniff_mode=True
+    return {
+      'type':proto,
+      'channel':chann_id
+    } 
     
 class ProtocolEncaps(ProtocolEncapsMethods,InputValidation):     
-  def encaps(self,data:str,recv_activate:threading.Event)->dict:
+  def encaps(self,data:str,recv_activate:threading.Event):
    user_input=data.split(' ')
    proto=user_input[0].upper()
-   if proto=='PUB' and self.validate(proto,user_input):
-    return self.pub_encaps(proto,user_input)
-   if proto=='PRIV' and self.validate(proto,user_input):
-      return self.priv_encaps(proto,user_input)
-   if proto=='LS' and self.validate(proto,user_input):
-     return self.ls_encaps(proto)
-   if proto=='SHELL' and self.validate(proto,user_input):
-       if user_input[1].upper()=='SHARE': 
-        self.system_expose=True
-        return self.shell_share_encaps(user_input[2:])
-       elif user_input[1].upper()=='EXIT':
-         return self.cancel_shell_share()
-   if proto=='SSH' and self.validate(proto,user_input):
-     return self.shell_req_encaps(user_input)
-   if proto=='SYSTEMS' and self.validate(proto,user_input):
-     return self.sys_encaps(proto)  
-   if proto=='SHELLS' and self.validate(proto,user_input):
-     return self.shells_encaps(proto)    
+   if not self.sniff_mode:
+    if proto=='PUB' and self.validate(proto,user_input):
+      return self.pub_encaps(proto,user_input)
+    if proto=='PRIV' and self.validate(proto,user_input):
+        return self.priv_encaps(proto,user_input)
+    if proto=='LS' and self.validate(proto,user_input):
+      return self.ls_encaps(proto)
+    if proto=='SHELL' and self.validate(proto,user_input):
+        if user_input[1].upper()=='SHARE': 
+          self.system_expose=True
+          return self.shell_share_encaps(user_input[2:])
+        elif user_input[1].upper()=='EXIT':
+          return self.cancel_shell_share()
+    if proto=='SSH' and self.validate(proto,user_input):
+      return self.shell_req_encaps(user_input[1:])
+    if proto=='SYSTEMS' and self.validate(proto,user_input):
+      return self.sys_encaps(proto)  
+    if proto=='SHELLS' and self.validate(proto,user_input):
+      return self.shells_encaps(proto)
+    if proto=='READ' and self.validate(proto,user_input):
+      return self.read_shell_channel_encaps(proto,user_input[1]) 
+   else:
+     if proto in ('EXIT','Q','QUIT'):
+      return self.exit_sniff()   
    raise ValueError()
    
 
@@ -352,14 +496,22 @@ class GeneralHandlers():
   def msg_handler(data:dict):
     msg=data['payload']
     print(msg)
-
-
+  @staticmethod
+  def shell_sniffer(data:dict):
+    print(data['stdout'])
+  @staticmethod
+  def packet_sniffer(data:dict):
+    print(data)
+    pass
+  
 class ProtocolDecaps(GeneralHandlers,ShellHandlers,Crypto):
   def proto_handler(self,data:dict,send_activate:threading.Event,recv_activate:threading.Event): 
     proto=data['type']
-    if not self.shell_mode:
+    if proto=='SERVER_TERMINATION':
+      self.EXIT()
+    if not (self.shell_mode or self.sniff_mode):
       if self.system_expose and proto=='SHELL_SESSION':
-        self.shell_handle(data)
+        threading.Thread(target=self.shell_handle,args=(data,),daemon=True).start()
       elif proto=='PUB':
         self.pub_handler(data)
       elif proto=='PRIV':
@@ -372,8 +524,15 @@ class ProtocolDecaps(GeneralHandlers,ShellHandlers,Crypto):
         self.ls_handler(data)     
       elif proto=='SHELL_RESP':
        threading.Thread(target=self.shell_req_res,args=(data,send_activate,recv_activate,),daemon=True).start()
+    elif self.sniff_mode:
+      if proto=='SHELL_SNIFFED':
+        self.shell_sniffer(data)
+      elif proto=='PACKET_SNIFFED':
+        self.packet_sniffer(data)
     elif self.shell_mode and proto=='SHELL_SESSION':
-       self.shell_executions.put(data)       
+        self.shell_executions.put(data) 
+
+
 
 
 class Protocol(ProtocolEncaps,ProtocolDecaps):
@@ -381,29 +540,17 @@ class Protocol(ProtocolEncaps,ProtocolDecaps):
     
 class Security(Protocol):
  def encrypt_session(self,session):
-  #locals initialization
+  print('Exchanging encryption keys...')
+  time.sleep(0.5)
   private_key_local=ec.generate_private_key(ec.SECP256R1())
   public_key_local=private_key_local.public_key().public_bytes(
     encoding=serialization.Encoding.PEM,
     format=serialization.PublicFormat.SubjectPublicKeyInfo
   )
-  pub_key_local_length=struct.pack('!I',len(public_key_local))
-
-  # recieve server pub key
-  pub_key_server_length=struct.unpack('!I',self.recv_length(session,4))[0]
-  pub_key_server_recvd_length=0
-  pub_key_server_bytes=b''
-  while pub_key_server_recvd_length<pub_key_server_length:
-   pub_key_server_part=session.recv(pub_key_server_length-pub_key_server_recvd_length)
-   pub_key_server_recvd_length+=len(pub_key_server_part)
-   pub_key_server_bytes+=pub_key_server_part
-  pub_key_server=serialization.load_pem_public_key(pub_key_server_bytes)
-  #send local pub key.
-  session.sendall(pub_key_local_length)
-  session.sendall(public_key_local)
-
-  shared_sec=private_key_local.exchange(ec.ECDH(),pub_key_server)
-  #encrypted session key (!IMPORTANT!)
+  pub_key_server=self.outbound_uncraft(session,decode=False)
+  session.sendall(self.craft(public_key_local))
+  shared_sec=private_key_local.exchange(ec.ECDH(),serialization.load_pem_public_key(pub_key_server))
+  print("// Connection has been encrypted successfully!")
   return HKDF(
    algorithm=hashes.SHA256(),
    length=16,
@@ -426,7 +573,7 @@ class Auth(Security):
     return self.resp(session,key)
    
   def resp(self,session,key):
-    extracted=self.outbound_uncraft(session,key)
+    extracted=self.outbound_uncraft(session,key,decode=True)
     print(extracted)
     if 'failure' in extracted.lower():
       return False
@@ -443,8 +590,8 @@ class Auth(Security):
       username=input('WHO_ARE_YOU?: ').encode('utf-8')
       data=self.craft(username,key)
       session.send(data)
-      msg=self.outbound_uncraft(session,key)
-      if 'success' not in msg:
+      msg=self.outbound_uncraft(session,key,decode=True)
+      if not 'success' in msg:
         print(msg)
         continue
       registered=True
@@ -452,11 +599,10 @@ class Auth(Security):
 class Client(Auth):
  def __init__(self):
   self.sk=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
-  self.send_activate=threading.Event()
-  self.recv_activate=threading.Event()
+
  
  def check_status(self,sock):
-   if 'error' in self.outbound_uncraft(sock).lower():
+   if 'error' in self.outbound_uncraft(sock,decode=True).lower():
     return False
    return True
  
@@ -464,40 +610,59 @@ class Client(Auth):
     server_ip=input("Server IP: ")
     server_port=int(input("Server Port: "))
     self.sk.connect((server_ip,server_port))
-    if not  self.check_status(self.sk):
-      self.sk.close()
-      raise PermissionError()     
+    # if not self.check_status(self.sk):
+    #   print("ran")
+    #   self.sk.close()
+    #   raise PermissionError() 
+    # 
+    #     
     self.crypto_key=self.encrypt_session(self.sk)
     authenticated=self.authenticate(self.sk,self.crypto_key)
     if not authenticated:
       raise  PermissionError()
-    
+   
+  
  def send(self,recv_activate:threading.Event):
-    while True:
+   try: 
+    while not self.kill.is_set():
       self.send_activate.wait()
       data=input("")
       if data.upper()=='HELP':
         self.HELP()
         continue
+      if data.upper() in ("EXIT",'QUIT'):
+        self.EXIT()
+        break
       try:
-       formatted:dict=self.encaps(data,recv_activate)
+       formatted=self.encaps(data,recv_activate)
+       if not formatted:
+         raise ValueError()
       except ValueError:
         print('// Unknown Protocol.type HELP to list available Commands.')
         continue
       data_to_send=self.craft(formatted,self.crypto_key)
       try:
-       self.sk.send(data_to_send)
-      except OSError:
+       self.sk.sendall(data_to_send)
+      except (OSError,BrokenPipeError):
         print("// Connection is closed!")
         break
+   except KeyboardInterrupt:
+     print("send keyboard interrupt")
+     self.EXIT()
 
-        
  def recv(self,send_activate:threading.Event):
-   while True:
+  try: 
+   while not self.kill.is_set():
      self.recv_activate.wait()
-     formatted=self.inbound_uncraft(self.sk,self.crypto_key)
+     try:
+      formatted=self.inbound_uncraft(self.sk,self.crypto_key)
+     except (OSError,ConnectionResetError):
+      
+      break 
      self.proto_handler(formatted,send_activate,self.recv_activate)
-   
+  except KeyboardInterrupt:
+    print("recv keyboard interrupt")
+    self.EXIT() 
 
  def activate(self):
    try:
@@ -516,7 +681,6 @@ class Client(Auth):
    self.recv_activate.set()  
    threading.Thread(target=self.send,args=(self.recv_activate,),daemon=False).start()
    threading.Thread(target=self.recv,args=(self.send_activate,),daemon=False).start()
-       
      
 if __name__=='__main__':
    cli=Client()
