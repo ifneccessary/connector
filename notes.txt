@@ -1,10 +1,2 @@
-3. IMPLEMENT SHELL HANDLER PTY, WINPTY from scratch
-
-
-
-
-
-2. load sniffer functionlity
-
 
 
