@@ -19,3 +19,7 @@ but use cases is absolutely depends on actual users.
 help cmd displays detailed explanation of available commands.
 
 ;)
+
+
+P.S packet sniffer loading functionality is not active. from name it's easy to know what it would've done.
+
