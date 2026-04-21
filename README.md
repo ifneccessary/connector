@@ -1,0 +1,24 @@
+i wrote Two programs,one for another.
+
+program called server.py should be ran on server :)
+
+agent.py is written for clients who connect to server.
+
+users are connected to group via agents running on their system.
+
+server program is just proxy for agents.
+
+encrypted group chat provides shell sharing capabilities among users.
+
+shell channels can be sniffed by other users if shell sharer sets proper privileges.
+
+programs are mainly written for group of pentesters among which one member of group is already compromised machine.
+
+but use cases is absolutely depends on actual users.
+
+help cmd displays detailed explanation of available commands.
+
+;)
+
+
+P.S packet sniffer loading functionality is not active. from name it's easy to know what it would've done.
